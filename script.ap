@@ -1,0 +1,29 @@
+String response = requestResponse.response().bodyToString();
+String baseUrl = requestResponse.request().url();
+
+if (response == null || response.isEmpty()) {
+    return "";
+}
+
+java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+    "(?i)(?:src|href)\\s*=\\s*[\"']([^\"']+\\.js(?:\\?[^\"']*)?)[\"']"
+);
+
+java.util.regex.Matcher matcher = pattern.matcher(response);
+
+java.util.Set<String> results = new java.util.LinkedHashSet<>();
+
+while (matcher.find()) {
+    String js = matcher.group(1);
+
+    if (js.startsWith("http://") || js.startsWith("https://")) {
+        results.add(js);
+    } else if (js.startsWith("//")) {
+        results.add("https:" + js);
+    } else if (js.startsWith("/")) {
+        java.net.URI uri = java.net.URI.create(baseUrl);
+        results.add(uri.getScheme() + "://" + uri.getAuthority() + js);
+    }
+}
+
+return String.join("\n", results);
