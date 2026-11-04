@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-import json, re, time
+
+
+import json, os, re, time
 import requests, msgpack
 
 # ------------------------------- CONFIG --------------------------------
@@ -103,6 +105,42 @@ def strings(data, minlen=4):
     return out
 
 
+def table_strings(data, minlen=2):
+    """Render batches hold text in a length-prefixed string table (7-bit length
+    + UTF-8). Scanning for that shape catches short strings that the printable-
+    run scan above merges into noise or drops entirely. Some false positives."""
+    out, i, n = [], 0, len(data)
+    while i < n:
+        try:
+            ln, j = read_varint(data, i)
+        except (ValueError, IndexError):
+            break
+        if minlen <= ln <= 4096 and j + ln <= n:
+            try:
+                s = data[j:j + ln].decode("utf-8")
+            except UnicodeDecodeError:
+                i += 1
+                continue
+            if s.isprintable():
+                out.append(s)
+                i = j + ln
+                continue
+        i += 1
+    return out
+
+
+def hexdump(data, width=16, limit=512):
+    rows = []
+    for off in range(0, min(len(data), limit), width):
+        chunk = data[off:off + width]
+        hx = " ".join(f"{b:02x}" for b in chunk)
+        asc = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+        rows.append(f"  {off:04x}  {hx:<{width * 3}} {asc}")
+    if len(data) > limit:
+        rows.append(f"  ... {len(data) - limit} more bytes")
+    return "\n".join(rows)
+
+
 # ------------------------------ recon ----------------------------------
 def harvest(base, cookie, path):
     """Pull the DP-signed component descriptors + persisted state from page HTML.
@@ -168,6 +206,7 @@ class Circuit:
         self.quiet = 0              # consecutive empty/timed-out polls
         self.acked = []             # batch ids we have acknowledged
         self.verbose = True
+        self.outdir = None          # set by run(); batches saved here
 
     # ---- transport ----
     def negotiate(self):
@@ -321,8 +360,25 @@ class Circuit:
                 print(f"[batch] args={[type(a).__name__ for a in args]} "
                       f"ints={[a for a in args if isinstance(a, int)]} -> ack {bid}")
             print(f"\n=== batch {bid}  {len(data)} bytes ===")
-            for s in strings(data):
-                print("   ", s)
+
+            if self.outdir:
+                os.makedirs(self.outdir, exist_ok=True)
+                p = os.path.join(self.outdir,
+                                 f"b{len(self.batches):02d}_id{bid}.bin")
+                with open(p, "wb") as f:
+                    f.write(data)
+                print(f"    saved {p}")
+
+            runs = strings(data)
+            tbl = table_strings(data)
+            if runs:
+                print("    runs :", runs)
+            if tbl:
+                print("    table:", tbl)
+            if not runs and not tbl:
+                print("    (no text -- structural diff only)")
+            if len(data) <= 256:
+                print(hexdump(data))
             if bid is not None:
                 self.invoke("OnRenderCompleted", bid, None, blocking=False)
                 self.acked.append(bid)
@@ -334,6 +390,13 @@ class Circuit:
                 "Blazor._internal.navigationManager.getLocationHref": self.target_uri,
                 "Blazor._internal.navigationManager.getUnmarshalledBaseURI":
                     self.base + "/",
+                # all void or legitimately-null -- stubbed to silence the noise
+                "Blazor._internal.navigationManager.enableNavigationInterception": None,
+                "Blazor._internal.navigationManager.setHasLocationChangingListeners": None,
+                "Blazor._internal.PageTitle.getAndRemoveExistingTitle": None,
+                "Blazor._internal.domWrapper.focusBySelector": None,
+                "Blazor._internal.domWrapper.focus": None,
+                "Blazor._internal.attachWebRendererInterop": None,
             }
             res = known.get(ident)
             if self.verbose:
@@ -401,6 +464,7 @@ def run(cookie, label="run", harvest_path=None, target_uri=None,
             return None
 
     c = Circuit(BASE, cookie)
+    c.outdir = os.path.join("batches", re.sub(r"[^\w.-]+", "_", label))
     c.negotiate()
     c.handshake()
     print(f"[*] StartCircuit uri -> {target_uri}")
@@ -412,6 +476,26 @@ def run(cookie, label="run", harvest_path=None, target_uri=None,
         c.navigate(navigate_to)
         c.pump(seconds)
     return c
+
+
+def compare(cookie, uris, harvest_path=None, seconds=25):
+    """Same cookie and descriptor, different StartCircuit uris.
+
+    This is the control. If every uri yields an identical batch stream then the
+    uri is not driving the route and the circuit is rendering the same thing
+    regardless. If they differ, routing happened and any difference on the
+    target route is an authorization decision.
+    """
+    res = {}
+    for u in uris:
+        c = run(cookie, f"uri {u.rsplit('/', 1)[-1] or 'root'}",
+                harvest_path=harvest_path, target_uri=u, seconds=seconds)
+        res[u] = [(bid, len(d)) for bid, d in (c.batches if c else [])]
+    print(f"\n{'=' * 64}\n  comparison\n{'=' * 64}")
+    for u, v in res.items():
+        print(f"{u}\n    {len(v)} batches, sizes={[n for _, n in v]}, "
+              f"total={sum(n for _, n in v)}")
+    return res
 
 
 if __name__ == "__main__":
@@ -426,6 +510,10 @@ if __name__ == "__main__":
 
     # 2. or arrive by in-circuit routing instead (different server code path)
     # c = run(COOKIE, "in-circuit nav", harvest_path=HARVEST, navigate_to=TARGET)
+
+    # 3. THE CONTROL: does the uri drive the route at all? Compare the blocked
+    #    route against a route this cookie is allowed, same descriptor.
+    # compare(COOKIE, [BASE.rstrip("/") + "/", TARGET], harvest_path=HARVEST)
 
     # once a batch shows the table, fire row handlers:
     #   c.dispatch_event(47)                               # click
