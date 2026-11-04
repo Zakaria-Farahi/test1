@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
+"""
+blazor_circuit.py -- scripted Blazor Server circuit client. No browser.
 
-import json, re, sys, time
+Speaks SignalR long polling + blazorpack directly:
+  negotiate -> handshake -> StartCircuit -> poll loop -> DispatchBrowserEvent
+
+Auto-acks render batches (OnRenderCompleted) and stubs JS interop
+(EndInvokeJSFromDotNet) so the circuit stays alive on its own.
+
+    pip install requests msgpack
+    python -I blazor_circuit.py
+
+BAC test: run with the admin cookie, confirm users come back. Swap to the
+low-priv cookie, rerun, diff. One variable.
+"""
+
+import json, re, time
 import requests, msgpack
 
 # ------------------------------- CONFIG --------------------------------
 BASE   = "https://target.example.com"
-PATH   = "/test"
+PATH   = "/usermanagement"
 COOKIE = "PASTE_SESSION_COOKIE_HERE"      # swap this, nothing else
 # ----------------------------------------------------------------------
 
@@ -42,17 +57,48 @@ def frame(obj):
     return varint(len(p)) + p
 
 
-def unframe(buf):
-    i = 0
+def iter_frames(buf, expect_text=False):
+    """Drain complete frames from buf (a bytearray, mutated in place).
+
+    A partial trailing frame is LEFT in the buffer for the next poll -- long
+    poll responses split large render batches, so this must be stateful or the
+    stream desyncs and the length prefix lands mid-payload.
+
+    Returns a list of ("text", bytes) for 0x1E-delimited records (the handshake
+    response) and ("msg", obj) for blazorpack frames.
+    """
+    out, i = [], 0
     while i < len(buf):
+        # Only the handshake response is text-framed. Do NOT sniff for '{'
+        # afterwards: a 123-byte blazorpack frame has 0x7B as its length prefix.
+        if expect_text:
+            k = buf.find(RS, i)
+            if k == -1:
+                break                           # incomplete
+            out.append(("text", bytes(buf[i:k])))
+            i = k + 1
+            expect_text = False
+            continue
         try:
             ln, j = read_varint(buf, i)
         except ValueError:
-            return
+            break                                # partial varint
         if j + ln > len(buf):
-            return                      # fragmented; next poll carries the rest
-        yield msgpack.unpackb(buf[j:j + ln], raw=False, strict_map_key=False)
+            break                                # partial payload
+        chunk = bytes(buf[j:j + ln])
+        try:
+            obj = msgpack.unpackb(chunk, raw=False, strict_map_key=False)
+        except msgpack.ExtraData as e:
+            obj = e.unpacked                     # tolerate a long prefix
+        except Exception as e:
+            print(f"[!] unpack failed at {i} (len {ln}): {e}")
+            print(f"    {chunk[:48].hex()}")
+            i = j + ln
+            continue
+        out.append(("msg", obj))
         i = j + ln
+    del buf[:i]
+    return out
 
 
 def strings(data, minlen=4):
@@ -106,6 +152,9 @@ class Circuit:
         self.alive = False
         self.next_id = 1
         self.batches = []
+        self.rx = bytearray()       # survives across polls -- see iter_frames
+        self.last_ping = time.time()
+        self.handshook = False
 
     # ---- transport ----
     def negotiate(self):
@@ -132,15 +181,10 @@ class Circuit:
 
     def handshake(self):
         self.send(json.dumps({"protocol": "blazorpack", "version": 1}).encode() + RS)
-        raw = self.poll()
-        head, _, rest = raw.partition(RS)
-        resp = json.loads(head or b"{}")
-        if resp.get("error"):
-            raise RuntimeError("handshake rejected: " + resp["error"])
-        self.alive = True
-        print("[+] handshake ok")
-        if rest:
-            self.handle(rest)
+        self.alive = True                   # provisional; handle() confirms
+        self.handle(self.poll())
+        if not self.alive:
+            raise RuntimeError("handshake rejected")
 
     # ---- hub calls ----
     def invoke(self, target, *args, blocking=True):
@@ -173,7 +217,22 @@ class Circuit:
 
     # ---- inbound ----
     def handle(self, raw):
-        for m in unframe(raw):
+        self.rx.extend(raw)
+        for kind, payload in iter_frames(self.rx, expect_text=not self.handshook):
+            if kind == "text":
+                self.handshook = True
+                try:
+                    resp = json.loads(payload or b"{}")
+                except Exception:
+                    continue
+                if resp.get("error"):
+                    self.alive = False
+                    print(f"[!] handshake rejected: {resp['error']}")
+                else:
+                    print("[+] handshake ok")
+                continue
+
+            m = payload
             if not isinstance(m, list) or not m:
                 continue
             t = m[0]
@@ -221,9 +280,14 @@ class Circuit:
     def pump(self, seconds=15):
         end = time.time() + seconds
         while self.alive and time.time() < end:
+            if time.time() - self.last_ping > 12:
+                self.send(frame([6]))            # ping
+                self.last_ping = time.time()
             raw = self.poll()
             if raw:
                 self.handle(raw)
+        if self.rx:
+            print(f"[i] {len(self.rx)} bytes buffered (partial frame pending)")
 
 
 # ------------------------------- driver ---------------------------------
