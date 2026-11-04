@@ -1,26 +1,10 @@
 #!/usr/bin/env python3
-"""
-blazor_circuit.py -- scripted Blazor Server circuit client. No browser.
-
-Speaks SignalR long polling + blazorpack directly:
-  negotiate -> handshake -> StartCircuit -> poll loop -> DispatchBrowserEvent
-
-Auto-acks render batches (OnRenderCompleted) and stubs JS interop
-(EndInvokeJSFromDotNet) so the circuit stays alive on its own.
-
-    pip install requests msgpack
-    python -I blazor_circuit.py
-
-BAC test: run with the admin cookie, confirm users come back. Swap to the
-low-priv cookie, rerun, diff. One variable.
-"""
-
 import json, re, time
 import requests, msgpack
 
 # ------------------------------- CONFIG --------------------------------
 BASE    = "https://target.example.com"
-PATH    = "/usermanagement"        # route you want, reachable or not
+PATH    = "/test"        # route you want, reachable or not
 HARVEST = "/"                      # any page THIS cookie can load
 COOKIE  = "PASTE_COOKIE_HERE"      # the only knob. "" = anonymous.
 #                                    which account this belongs to IS the test.
@@ -177,8 +161,13 @@ class Circuit:
         self.rx = bytearray()       # survives across polls -- see iter_frames
         self.last_ping = time.time()
         self.handshook = False
-        self.poll_timeout = 100     # must exceed SignalR PollTimeout (~90s)
+        self.target_uri = self.base + "/"   # set by start_circuit
+        # Under a reverse proxy the proxy's read timeout (often 60s) fires before
+        # SignalR's PollTimeout (~90s) and you get a 504. Stay under the proxy.
+        self.poll_timeout = 50
         self.quiet = 0              # consecutive empty/timed-out polls
+        self.acked = []             # batch ids we have acknowledged
+        self.verbose = True
 
     # ---- transport ----
     def negotiate(self):
@@ -220,6 +209,16 @@ class Circuit:
             print("[x] server closed the connection (204)")
             self.alive = False
             return b""
+        if r.status_code in (502, 503, 504):
+            # Proxy timeout on an idle poll. The circuit is usually still alive
+            # server side -- re-poll rather than giving up.
+            print(f"[~] proxy {r.status_code} on idle poll; re-polling")
+            self.quiet += 1
+            return b""
+        if r.status_code in (404, 410):
+            print(f"[x] connection gone (HTTP {r.status_code}) -- circuit expired")
+            self.alive = False
+            return b""
         if r.status_code != 200:
             print(f"[!] poll HTTP {r.status_code}: {r.text[:200]}")
             self.alive = False
@@ -244,6 +243,7 @@ class Circuit:
     def start_circuit(self, uri, descriptors, app_state="", raw_args=None):
         """raw_args: pass your BTP-decoded arg list verbatim if the signature
         differs -- it changed across .NET versions. Yours is authoritative."""
+        self.target_uri = uri
         if raw_args is not None:
             return self.invoke("StartCircuit", *raw_args)
         return self.invoke("StartCircuit", self.base + "/", uri,
@@ -303,28 +303,53 @@ class Circuit:
 
     def server_call(self, target, args):
         if target == "JS.RenderBatch":
-            bid = next((a for a in args if isinstance(a, int)), None)
-            data = next((a for a in args if isinstance(a, (bytes, bytearray))), b"")
-            self.batches.append((bid, bytes(data)))
+            # Signature varies by version: (batchId, data) or
+            # (browserRendererId, batchId, data). The id to ACK is the int
+            # immediately before the payload -- acking the wrong one silently
+            # stalls the circuit once MaxBufferedUnacknowledgedRenderBatches
+            # (default 10) is reached.
+            di = next((i for i, a in enumerate(args)
+                       if isinstance(a, (bytes, bytearray))), None)
+            data = bytes(args[di]) if di is not None else b""
+            if di is not None and di > 0 and isinstance(args[di - 1], int):
+                bid = args[di - 1]
+            else:
+                bid = next((a for a in args if isinstance(a, int)), None)
+
+            self.batches.append((bid, data))
+            if self.verbose:
+                print(f"[batch] args={[type(a).__name__ for a in args]} "
+                      f"ints={[a for a in args if isinstance(a, int)]} -> ack {bid}")
             print(f"\n=== batch {bid}  {len(data)} bytes ===")
             for s in strings(data):
                 print("   ", s)
             if bid is not None:
                 self.invoke("OnRenderCompleted", bid, None, blocking=False)
+                self.acked.append(bid)
 
         elif target == "JS.BeginInvokeJS":
             handle, ident = args[0], args[1]
-            res = {"Blazor._internal.navigationManager.getBaseURI": self.base + "/",
-                   "Blazor._internal.navigationManager.getLocationHref":
-                       self.base + PATH}.get(ident)
-            self.invoke("EndInvokeJSFromDotNet", handle, True,
-                        json.dumps([handle, True, res]), blocking=False)
+            known = {
+                "Blazor._internal.navigationManager.getBaseURI": self.base + "/",
+                "Blazor._internal.navigationManager.getLocationHref": self.target_uri,
+                "Blazor._internal.navigationManager.getUnmarshalledBaseURI":
+                    self.base + "/",
+            }
+            res = known.get(ident)
+            if self.verbose:
+                mark = "" if ident in known else "  <-- UNSTUBBED"
+                print(f"[interop] handle={handle} {ident}{mark}")
+            # handle 0 means fire-and-forget; the server expects no reply.
+            if handle:
+                self.invoke("EndInvokeJSFromDotNet", handle, True,
+                            json.dumps([handle, True, res]), blocking=False)
 
         elif target in ("JS.AttachComponent", "JS.EndInvokeDotNet",
                         "JS.EndLocationChanging"):
-            pass
+            if self.verbose:
+                print(f"[s->c] {target}")
         else:
-            print(f"[s->c] {target} {str(args)[:120]}")
+            print(f"[s->c] {target} {str(args)[:160]}")
 
     def pump(self, seconds=30, quiet_limit=1):
         """Poll until `seconds` elapses, or until the circuit goes quiet after
